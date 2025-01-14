@@ -25,6 +25,22 @@ const CONFIG = {
     WALLET_ADDRESS: process.env.WALLET_PUBLIC_KEY!
 };
 
+// Add a global variable to store initial volumes
+const initialVolumes = new Map<string, number>();
+
+// Add new interfaces for tracking metrics
+interface TokenMetrics {
+    tokenName: string;
+    rsi: number;
+    rsiTimestamp: number;
+    volume: number;
+    volumeChange: number;
+    volumeChangePercent: number;
+}
+
+// Add global map for token metrics
+const tokenMetrics = new Map<string, TokenMetrics>();
+
 // Helper function to get token price from Jupiter API
 async function getTokenPrice(tokenMint: string): Promise<number> {
     try {
@@ -72,22 +88,18 @@ async function getMostLiquidPool(tokenMint: string): Promise<string | null> {
 }
 
 // Helper function to calculate RSI using GeckoTerminal OHLCV data
-async function calculateRSI(tokenMint: string): Promise<number> {
+async function calculateRSI(tokenMint: string, poolAddress: string): Promise<{ rsi: number; timestamp: number }> {
     try {
-        // Get the most liquid pool first
-        const mostLiquidPool = await getMostLiquidPool(tokenMint);
-        if (!mostLiquidPool) {
-            console.log('No liquid pool found for token:', tokenMint);
-            return 0;
-        }
-
         // Fetch OHLCV data from the most liquid pool
-        const response = await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${mostLiquidPool}/ohlcv/minute?aggregate=5`);
+        const response = await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${poolAddress}/ohlcv/minute?aggregate=5`);
         const data = await response.json();
         
         if (!data.data?.attributes?.ohlcv_list?.length) {
-            return 0;
+            return { rsi: 0, timestamp: Date.now() };
         }
+
+        // Get the timestamp of the latest candle
+        const latestTimestamp = data.data.attributes.ohlcv_list[0][0];
 
         // OHLCV format: [timestamp, open, high, low, close, volume]
         const closes = data.data.attributes.ohlcv_list.map((candle: number[]) => candle[4]).reverse();
@@ -124,14 +136,14 @@ async function calculateRSI(tokenMint: string): Promise<number> {
         }
 
         // Calculate final RSI
-        if (avgLoss === 0) return 100;
+        if (avgLoss === 0) return { rsi: 100, timestamp: latestTimestamp };
         const rs = avgGain / avgLoss;
         const rsi = 100 - (100 / (1 + rs));
 
-        return rsi;
+        return { rsi, timestamp: latestTimestamp };
     } catch (error) {
         console.error('Error calculating RSI:', error);
-        return 0;
+        return { rsi: 0, timestamp: Date.now() };
     }
 }
 
@@ -159,13 +171,22 @@ async function getInitialDeposit(positionAddress: string): Promise<any> {
         if (deposits && deposits.length > 0) {
             const deposit = deposits[0]; // Get the first deposit
             const timestamp = new Date(deposit.onchain_timestamp * 1000).toLocaleString();
+            
+            // Get historical RSI at deposit time from the most liquid pool
+            const tokenMint = deposit.token_x_mint === CONFIG.SOL_TOKEN_ADDRESS ? deposit.token_y_mint : deposit.token_x_mint;
+            const topPool = await getMostLiquidPool(tokenMint);
+            const { rsi: initialRsi, timestamp: rsiTimestamp } = topPool ? await calculateRSI(tokenMint, topPool) : { rsi: 0, timestamp: deposit.onchain_timestamp };
+            
             return {
                 tokenXAmount: deposit.token_x_amount,
                 tokenYAmount: deposit.token_y_amount,
                 tokenXUsdAmount: deposit.token_x_usd_amount,
                 tokenYUsdAmount: deposit.token_y_usd_amount,
                 timestamp: timestamp,
-                price: deposit.price
+                price: deposit.price,
+                onchain_timestamp: deposit.onchain_timestamp,
+                initialRsi,
+                rsiTimestamp
             };
         }
         return null;
@@ -197,47 +218,127 @@ async function getCurrentDynamicFee(poolAddress: string): Promise<number | null>
     }
 }
 
-console.log('Starting position check...');
-
-async function main() {
+// Helper function to get pool volume data
+async function getPoolVolumeData(poolAddress: string): Promise<{ volume: number; timestamp: number }> {
     try {
-        console.log('Initializing connection to Solana...');
-        console.log('RPC Endpoint:', process.env.SOLANA_RPC_ENDPOINT);
-        const connection = new Connection(
-            process.env.SOLANA_RPC_ENDPOINT!,
-            { commitment: 'confirmed' as Commitment }
+        // Clean pool address from URL if needed
+        const cleanPoolAddress = poolAddress.includes('/') 
+            ? poolAddress.split('/').pop()! 
+            : poolAddress;
+
+        // Get hourly volume data
+        const response = await fetch(
+            `https://dlmm-api.meteora.ag/pair/${cleanPoolAddress}/analytic/pair_trade_volume?num_of_days=1`,
+            {
+                headers: {
+                    'accept': 'application/json'
+                }
+            }
         );
 
-        const userPublicKey = new PublicKey(process.env.WALLET_PUBLIC_KEY!);
-        console.log('Using wallet:', userPublicKey.toString());
+        if (!response.ok) {
+            console.log(`Failed to fetch volume data: ${response.status} ${response.statusText}`);
+            return { volume: 0, timestamp: Date.now() };
+        }
+
+        const data = await response.json();
+        
+        if (!Array.isArray(data) || data.length === 0) {
+            console.log('No volume data in response:', data);
+            return { volume: 0, timestamp: Date.now() };
+        }
+
+        const volumeData = data[0];
+        if (!volumeData.trade_volume) {
+            console.log('No trade volume in data:', volumeData);
+            return { volume: 0, timestamp: Date.now() };
+        }
+
+        const hourlyVolume = parseFloat(volumeData.trade_volume) / 24;
+        
+        return {
+            volume: hourlyVolume,
+            timestamp: Date.now()
+        };
+    } catch (error) {
+        console.log('Error fetching volume data:', error);
+        return { volume: 0, timestamp: Date.now() };
+    }
+}
+
+// Main function to check positions
+async function main() {
+    try {
+        console.log('Starting position check script...');
+        console.log('RPC Endpoint:', CONFIG.RPC_ENDPOINT);
+        console.log('Wallet Address:', CONFIG.WALLET_ADDRESS);
+
+        // Initialize connection with commitment level
+        const connection = new Connection(CONFIG.RPC_ENDPOINT, 'confirmed');
+        console.log('Connection initialized');
+
+        // Get all positions
+        const userPositions = await DLMM.getAllLbPairPositionsByUser(
+            connection,
+            new PublicKey(CONFIG.WALLET_ADDRESS)
+        );
+        console.log('Found positions:', userPositions.size);
+
+        if (userPositions.size === 0) {
+            console.log('No positions found for this wallet');
+            return;
+        }
 
         let totalLiquidityValue = 0;
         let totalClaimedFees = 0;
         let totalUnclaimedFees = 0;
+
         let totalPositions = 0;
         let inRangePositions = 0;
         let totalInitialValue = 0;  // Track total initial deposit value
 
         console.log('\nFetching positions...');
-        const userPositions = await DLMM.getAllLbPairPositionsByUser(
-            connection,
-            userPublicKey
-        );
+
+        // Clear token metrics for new update
+        tokenMetrics.clear();
 
         for (const [poolAddress, _] of userPositions.entries()) {
             const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
             const activeBin = await dlmmPool.getActiveBin();
             const currentBinId = activeBin.binId;
             
-            const { userPositions: poolPositions } = await dlmmPool.getPositionsByUserAndLbPair(userPublicKey);
+            const { userPositions: poolPositions } = await dlmmPool.getPositionsByUserAndLbPair(new PublicKey(CONFIG.WALLET_ADDRESS));
             const tokenXPrice = await getTokenPrice(dlmmPool.tokenX.publicKey.toString());
             const tokenYPrice = await getTokenPrice(dlmmPool.tokenY.publicKey.toString());
 
             // Determine which token is SOL and which is the other token
             const solTokenPublicKey = CONFIG.SOL_TOKEN_ADDRESS;
             const nonSolToken = dlmmPool.tokenX.publicKey.toString() === solTokenPublicKey ? dlmmPool.tokenY : dlmmPool.tokenX;
-            const rsi = await calculateRSI(nonSolToken.publicKey.toString());
-            const tokenName = await getTokenName(nonSolToken.publicKey.toString());
+            const nonSolTokenMint = nonSolToken.publicKey.toString();
+            
+            // Get the most liquid pool for RSI calculation
+            const topPool = await getMostLiquidPool(nonSolTokenMint);
+            const { rsi, timestamp: currentRsiTimestamp } = topPool ? await calculateRSI(nonSolTokenMint, topPool) : { rsi: 0, timestamp: Date.now() };
+            const tokenName = await getTokenName(nonSolTokenMint);
+
+            // Store token metrics
+            if (!tokenMetrics.has(nonSolTokenMint)) {
+                const { rsi, timestamp: currentRsiTimestamp } = topPool ? await calculateRSI(nonSolTokenMint, topPool) : { rsi: 0, timestamp: Date.now() };
+                const currentVolumeData = await getPoolVolumeData(poolAddress);
+                const initialVolume = initialVolumes.get(poolAddress) || currentVolumeData.volume;
+                if (!initialVolumes.has(poolAddress)) {
+                    initialVolumes.set(poolAddress, currentVolumeData.volume);
+                }
+                
+                tokenMetrics.set(nonSolTokenMint, {
+                    tokenName: await getTokenName(nonSolTokenMint),
+                    rsi,
+                    rsiTimestamp: currentRsiTimestamp,
+                    volume: currentVolumeData.volume,
+                    volumeChange: currentVolumeData.volume - initialVolume,
+                    volumeChangePercent: ((currentVolumeData.volume - initialVolume) / initialVolume) * 100
+                });
+            }
 
             for (const positionDetails of poolPositions) {
                 totalPositions++;
@@ -304,26 +405,24 @@ async function main() {
                 console.log(`   ├── Unclaimed Fees: $${unclaimedValue.toFixed(2)}`);
                 console.log(`   └── Total Current Value: $${(positionValue + claimedValue + unclaimedValue).toFixed(2)}`);
                 console.log(`\n📈 Total Fees (Claimed + Unclaimed): $${(claimedValue + unclaimedValue).toFixed(2)}`);
-                console.log(`📊 5min RSI (${tokenName}): ${rsi.toFixed(2)}`);
 
                 // Add initial deposit information and PnL
                 const depositInfo = await getInitialDeposit(positionDetails.publicKey.toString());
                 if (depositInfo) {
                     const initialValue = depositInfo.tokenXUsdAmount + depositInfo.tokenYUsdAmount;
                     totalInitialValue += initialValue;
-                    // Total current value includes position value plus all fees
-                    const totalCurrentValue = positionValue + claimedValue + unclaimedValue;
-                    const pnl = totalCurrentValue - initialValue;
-                    const pnlPercentage = (pnl / initialValue) * 100;
 
                     console.log('\n📝 Initial Deposit Information:');
                     console.log(`└── 🕒 Timestamp: ${depositInfo.timestamp}`);
                     console.log(`└── 💲 Initial Price: $${depositInfo.price.toFixed(8)}`);
                     console.log(`└── 💰 Initial Value: $${initialValue.toFixed(2)}`);
                     console.log(`└── 💵 Current Total Value: $${totalCurrentValue.toFixed(2)}`);
+                    const pnl = totalCurrentValue - initialValue;
+                    const pnlPercentage = (pnl / initialValue) * 100;
                     const pnlEmoji = pnl >= 0 ? '📈' : '📉';
                     console.log(`└── ${pnlEmoji} PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPercentage >= 0 ? '+' : ''}${pnlPercentage.toFixed(2)}%)`);
                 }
+
                 console.log('\n' + '─'.repeat(50));
             }
         }
@@ -344,15 +443,27 @@ async function main() {
         console.log(`    ├── Claimed Fees: $${totalClaimedFees.toFixed(2)}`);
         console.log(`    ├── Unclaimed Fees: $${totalUnclaimedFees.toFixed(2)}`);
         console.log(`    └── Total Current Value: $${(totalLiquidityValue + totalClaimedFees + totalUnclaimedFees).toFixed(2)}`);
-        
+
         const totalPnL = (totalLiquidityValue + totalClaimedFees + totalUnclaimedFees) - totalInitialValue;
         const totalPnLPercentage = totalInitialValue > 0 ? (totalPnL / totalInitialValue) * 100 : 0;
         const pnlEmoji = totalPnL >= 0 ? '📈' : '📉';
         console.log(`\n${pnlEmoji} TOTAL PnL: ${totalPnL >= 0 ? '+' : ''}$${totalPnL.toFixed(2)} (${totalPnLPercentage >= 0 ? '+' : ''}${totalPnLPercentage.toFixed(2)}%)`);
-        console.log('==========================================');
+
+        // Add Token Metrics Summary
+        console.log('\n📊 TOKEN METRICS');
+        for (const [_, metrics] of tokenMetrics) {
+            console.log(`\n└── 💱 SOL/${metrics.tokenName}`);
+            console.log(`    ├── RSI (5min): ${metrics.rsi.toFixed(2)} (${new Date(metrics.rsiTimestamp).toLocaleString()})`);
+            console.log(`    ├── Hourly Volume: $${metrics.volume.toFixed(2)}`);
+            const volumeEmoji = metrics.volumeChange >= 0 ? '📈' : '📉';
+            console.log(`    ├── ${volumeEmoji} Volume Change: ${metrics.volumeChange >= 0 ? '+' : ''}$${metrics.volumeChange.toFixed(2)}/hour`);
+            console.log(`    └── Volume Change %: ${metrics.volumeChangePercent >= 0 ? '+' : ''}${metrics.volumeChangePercent.toFixed(2)}%`);
+        }
+        
+        console.log('\n==========================================');
 
     } catch (error) {
-        console.error('Error:', error);
+        console.error('Error in main function:', error);
     }
 }
 
@@ -362,20 +473,24 @@ async function clearScreen() {
 }
 
 async function monitorPositions() {
-    while (true) {
+    // Initial run
+    await main();
+    
+    // Set up interval for subsequent runs
+    setInterval(async () => {
         try {
             await clearScreen();
             console.log(`\n🔄 Last Update: ${new Date().toLocaleTimeString()}`);
             await main();
-            console.log('\n⏳ Refreshing in ' + (CONFIG.UPDATE_INTERVAL / 1000) + ' seconds...');
-            await setTimeout(CONFIG.UPDATE_INTERVAL);
+            console.log('\n⏳ Next update in ' + (CONFIG.UPDATE_INTERVAL / 1000) + ' seconds...');
         } catch (error) {
             console.error('Error in monitoring loop:', error);
-            await setTimeout(CONFIG.ERROR_RETRY_DELAY);
         }
-    }
+    }, CONFIG.UPDATE_INTERVAL);
 }
 
-// Start monitoring instead of single main() call
-console.log('Starting position monitor (refreshes every minute)...');
-monitorPositions(); 
+// Run the script
+console.log('Starting position monitor...');
+monitorPositions().catch(error => {
+    console.error('Unhandled error:', error);
+}); 
